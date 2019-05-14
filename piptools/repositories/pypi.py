@@ -1,14 +1,16 @@
 # coding: utf-8
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import collections
+import abc
+import contextlib
+import functools
 import hashlib
 import os
-from contextlib import contextmanager
 from shutil import rmtree
 
 import pip
 import pkg_resources
+import six
 
 from .._compat import (
     FAVORITE_HASH,
@@ -18,13 +20,13 @@ from .._compat import (
     RequirementSet,
     TemporaryDirectory,
     Wheel,
-    contextlib,
     is_dir_url,
     is_file_url,
     is_vcs_url,
     path_to_url,
     url_to_path,
 )
+from .._compat.contextlib import nullcontext
 from ..cache import CACHE_DIR
 from ..click import progressbar
 from ..exceptions import NoCandidateFound
@@ -42,7 +44,7 @@ try:
     from pip._internal.req.req_tracker import RequirementTracker
 except ImportError:
 
-    @contextmanager
+    @contextlib.contextmanager
     def RequirementTracker():
         yield
 
@@ -53,7 +55,6 @@ except ImportError:
     from pip.wheel import WheelCache
 
 FILE_CHUNK_SIZE = 4096
-FileStream = collections.namedtuple("FileStream", "stream size")
 
 
 class PyPIRepository(BaseRepository):
@@ -331,23 +332,29 @@ class PyPIRepository(BaseRepository):
         log.debug("    Hashing {}".format(location.url_without_fragment))
         h = hashlib.new(FAVORITE_HASH)
         with open_local_or_remote_file(location, self.session) as f:
+            headers = f.headers()
+            hash_header = headers.get("x-checksum-{h.name}".format(h=h))
+            if hash_header:
+                return ":".join([h.name, hash_header])
+
             # Chunks to iterate
-            chunks = iter(lambda: f.stream.read(FILE_CHUNK_SIZE), b"")
+            chunks = f.iter_content(FILE_CHUNK_SIZE)
 
             # Choose a context manager depending on verbosity
             if log.verbosity >= 1:
-                iter_length = f.size / FILE_CHUNK_SIZE if f.size else None
+                size = f.size()
+                iter_length = size / FILE_CHUNK_SIZE if size else None
                 context_manager = progressbar(chunks, length=iter_length, label="  ")
             else:
-                context_manager = contextlib.nullcontext(chunks)
+                context_manager = nullcontext(chunks)
 
             # Iterate over the chosen context manager
             with context_manager as bar:
                 for chunk in bar:
                     h.update(chunk)
-        return ":".join([FAVORITE_HASH, h.hexdigest()])
+        return ":".join([h.name, h.hexdigest()])
 
-    @contextmanager
+    @contextlib.contextmanager
     def allow_all_wheels(self):
         """
         Monkey patches pip.Wheel to allow wheels from all platforms and Python versions.
@@ -380,15 +387,62 @@ class PyPIRepository(BaseRepository):
             self._available_candidates_cache = original_cache
 
 
-@contextmanager
+@six.add_metaclass(abc.ABCMeta)
+class WrappedResponse(object):
+    @abc.abstractmethod
+    def iter_content(self, chunk_size):
+        pass
+
+    @abc.abstractmethod
+    def size(self):
+        pass
+
+    @abc.abstractmethod
+    def headers(self):
+        pass
+
+
+class FileResponse(WrappedResponse):
+    def __init__(self, fd):
+        self._fd = fd
+
+    def iter_content(self, chunk_size):
+        return iter(functools.partial(self._fd.read, chunk_size), b"")
+
+    def size(self):
+        return os.stat(self._fd.name).st_size
+
+    def headers(self):
+        return {}
+
+
+class RequestsResponse(WrappedResponse):
+    def __init__(self, response):
+        self._response = response
+
+    def iter_content(self, chunk_size):
+        return self._response.iter_content(chunk_size)
+
+    def size(self):
+        headers = self.headers()
+        try:
+            return int(headers["content-length"])
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def headers(self):
+        return self._response.headers
+
+
+@contextlib.contextmanager
 def open_local_or_remote_file(link, session):
     """
-    Open local or remote file for reading.
+    Open local or remote resource for hashing.
 
     :type link: pip.index.Link
     :type session: requests.Session
     :raises ValueError: If link points to a local directory.
-    :return: a context manager to a FileStream with the opened file-like object
+    :return: a context manager to a WrappedResponse with the opened resource.
     """
     url = link.url_without_fragment
 
@@ -397,22 +451,10 @@ def open_local_or_remote_file(link, session):
         local_path = url_to_path(url)
         if os.path.isdir(local_path):
             raise ValueError("Cannot open directory for read: {}".format(url))
-        else:
-            st = os.stat(local_path)
-            with open(local_path, "rb") as local_file:
-                yield FileStream(stream=local_file, size=st.st_size)
-    else:
-        # Remote URL
-        headers = {"Accept-Encoding": "identity"}
-        response = session.get(url, headers=headers, stream=True)
+        with open(local_path, "rb") as local_file:
+            yield FileResponse(local_file)
+        return
 
-        # Content length must be int or None
-        try:
-            content_length = int(response.headers["content-length"])
-        except (ValueError, KeyError, TypeError):
-            content_length = None
-
-        try:
-            yield FileStream(stream=response.raw, size=content_length)
-        finally:
-            response.close()
+    # Remote URL
+    with contextlib.closing(session.get(url, stream=True)) as response:
+        yield RequestsResponse(response)

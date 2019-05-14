@@ -97,8 +97,8 @@ def test_open_local_or_remote_file__local_file(tmp_path, content, content_length
     session = Session()
 
     with open_local_or_remote_file(link, session) as file_stream:
-        assert file_stream.stream.read() == content
-        assert file_stream.size == content_length
+        assert b"".join(file_stream.iter_content(2048)) == content
+        assert file_stream.size() == content_length
 
 
 def test_open_local_or_remote_file__directory(tmpdir):
@@ -119,25 +119,20 @@ def test_open_local_or_remote_file__directory(tmpdir):
     [(b"foo", 3, 3), (b"bar", None, None), (b"kek", "invalid-content-length", None)],
 )
 def test_open_local_or_remote_file__remote_file(
-    tmp_path, content, content_length, expected_content_length
+    content, content_length, expected_content_length
 ):
     """
     Test the `open_local_or_remote_file` returns a context manager to a FileStream
     for a given `Link` to a remote file.
     """
     link = Link("https://example.com/foo.txt")
-    session = Session()
+    headers = {"content-length": content_length}
+    response = mock.Mock(headers=headers)
+    session = mock.Mock(**{"get.return_value": response})
 
-    response_file_path = tmp_path / "foo.txt"
-    response_file_path.write_bytes(content)
+    with open_local_or_remote_file(link, session) as file_stream:
+        assert file_stream.iter_content(1024) is response.iter_content(1024)
+        assert file_stream.size() == expected_content_length
+        assert file_stream.headers() is headers
 
-    mock_response = mock.Mock()
-    mock_response.raw = response_file_path.open("rb")
-    mock_response.headers = {"content-length": content_length}
-
-    with mock.patch.object(session, "get", return_value=mock_response):
-        with open_local_or_remote_file(link, session) as file_stream:
-            assert file_stream.stream.read() == content
-            assert file_stream.size == expected_content_length
-
-    mock_response.close.assert_called_once()
+    response.close.assert_called_once()
