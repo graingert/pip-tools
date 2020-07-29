@@ -24,6 +24,7 @@ COMPILE_EXCLUDE_OPTIONS = {
     "--upgrade-package",
     "--verbose",
     "--cache-dir",
+    "--no-reuse-hashes",
 }
 
 
